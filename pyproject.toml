@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "griffey"
+requires-python = ">=3.10"
+version = "0.1.0"
+readme = "README.md"
+dependencies = [
+  "pydantic>=2.0.0",
+  "pandas>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pip-tools", "pytest", "toml-cli"]
+
+[tool.setuptools]
+packages.find.exclude = ["test*"]
+include-package-data = false
