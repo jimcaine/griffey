@@ -1,5 +1,5 @@
 """
-model.py – EfficientNet-V2-S backbone with a lightweight binary classification head.
+model.py – EfficientNet-V2-S backbone with an 8-class swing event classification head.
 
 Why EfficientNet-V2-S over MobileNetV2?
   • ~25% higher ImageNet top-1 accuracy (83.9% vs 71.8%)
@@ -22,7 +22,8 @@ from torchvision.models import (
 
 class GolfSwingClassifier(nn.Module):
     """
-    Binary classifier: 1 = frame is between Toe-up and Mid-backswing.
+    8-class swing event classifier: predicts which phase each frame belongs to
+    (0=Address, 1=Toe-up, ..., 7=Finish).
 
     The head is intentionally small – the pretrained backbone already
     extracts rich spatial features; we just need a robust linear readout
@@ -78,7 +79,7 @@ class GolfSwingClassifier(nn.Module):
             nn.Linear(in_features, 256),
             nn.GELU(),
             nn.Dropout(dropout * 0.5),
-            nn.Linear(256, 1),   # raw logit – use BCEWithLogitsLoss
+            nn.Linear(256, 8),   # 8-class logits – use CrossEntropyLoss
         )
 
         # Sensible weight initialisation for the head
@@ -89,9 +90,9 @@ class GolfSwingClassifier(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, C, H, W) → logits: (B,)"""
+        """x: (B, C, H, W) → logits: (B, 8)"""
         features = self.backbone(x)          # (B, in_features)
-        return self.head(features).squeeze(1)  # (B,)
+        return self.head(features)           # (B, 8)
 
     def unfreeze_all(self) -> None:
         """Call after initial warm-up to fine-tune the full network."""

@@ -2,9 +2,12 @@
 data.py – Golf swing dataset & streaming data loader.
 
 Label convention:
-    1  → frame is strictly between Toe-up (TU, event index 1) and
-          Mid-backswing (MB, event index 2)
-    0  → everything else
+    0–7 → frame phase label based on which swing event segment it falls in.
+          Each frame is assigned the index of the last event it has passed.
+          Example: if events = [0, 47, 65, ...], then:
+            frames [0, 47) → label 0 (Address)
+            frames [47, 65) → label 1 (Toe-up)
+            frames [65, ...) → label 2 (Mid-backswing), etc.
 
 Bounding box convention (normalised, relative to frame W×H):
     [x_min, y_min, x_max, y_max]
@@ -94,21 +97,27 @@ def read_train_data(blobfs: LocalBlobfs) -> pd.DataFrame:
 
 def build_frame_labels(events: list[int]) -> dict[int, int]:
     """
-    Return {frame_index: label} for every frame in the clip.
+    Return {frame_index: label} mapping frames to their event phase (0–7).
 
-    Frames in (TU, MB) exclusive → label 1, all others → label 0.
-    If either event is missing / out of range the whole clip is label-0.
+    Each frame is assigned the index of the last event it has passed.
+    Frames before the first event get label 0; frames are labeled greedily
+    by the most recent event boundary they cross.
+    If events list is empty or malformed, returns empty dict.
     """
-    if len(events) <= MB_IDX:
+    if not events:
         return {}
 
-    tu_frame = events[TU_IDX]
-    mb_frame = events[MB_IDX]
-
     labels: dict[int, int] = {}
-    # We don't know total frame count here; the dataset fills in the rest.
-    for f in range(tu_frame + 1, mb_frame):
-        labels[f] = 1
+    # For each possible frame, find which event phase it's in by checking
+    # which is the latest event it has passed. We don't know total frame count
+    # here, so we only label frames that are referenced by events.
+    max_event_frame = max(events) if events else 0
+    for f in range(max_event_frame + 1):
+        label = 0
+        for i, evt_frame in enumerate(events):
+            if f >= evt_frame:
+                label = i
+        labels[f] = label
     return labels
 
 
@@ -138,9 +147,9 @@ def crop_frame(frame_np: np.ndarray, bbox: list[float]) -> np.ndarray:
 
 class GolfSwingDataset(Dataset):
     """
-    Frame-level dataset for the TU→MB binary classification task.
+    Frame-level dataset for the 8-class swing event phase classification task.
 
-    Each item is (tensor_CHW_float32, label_int).
+    Each item is (tensor_CHW_float32, label_int) where label ∈ {0..7}.
 
     Args:
         df            – DataFrame produced by read_train_data().
@@ -179,7 +188,7 @@ class GolfSwingDataset(Dataset):
                 logger.warning("Skipping %s – could not probe frame count", vpath)
                 continue
 
-            pos_set = set(build_frame_labels(events).keys())   # label-1 frames
+            label_map = build_frame_labels(events)
 
             all_frames = list(range(total_frames))
             if max_frames and len(all_frames) > max_frames:
@@ -187,16 +196,15 @@ class GolfSwingDataset(Dataset):
                 all_frames = sorted(rng.choice(all_frames, max_frames, replace=False).tolist())
 
             for fidx in all_frames:
-                label = 1 if fidx in pos_set else 0
+                label = label_map.get(fidx, 0)  # default to label 0 if out of events range
                 self.samples.append((vpath, bbox, fidx, label))
 
-        pos_count = sum(s[3] for s in self.samples)
-        neg_count = len(self.samples) - pos_count
+        class_counts = [0] * 8
+        for s in self.samples:
+            class_counts[s[3]] += 1
         logger.info(
-            "Dataset built: %d samples | pos=%d (%.1f%%) | neg=%d",
-            len(self.samples), pos_count,
-            100 * pos_count / max(len(self.samples), 1),
-            neg_count,
+            "Dataset built: %d samples | class dist: %s",
+            len(self.samples), class_counts,
         )
 
         # Transforms
@@ -230,13 +238,16 @@ class GolfSwingDataset(Dataset):
         return tensor, label
 
     # ── Class-weight helper for imbalanced data ──────────────────────────────
-    def pos_weight(self) -> torch.Tensor:
-        """Returns BCEWithLogitsLoss pos_weight = neg_count / pos_count."""
-        pos = sum(s[3] for s in self.samples)
-        neg = len(self.samples) - pos
-        if pos == 0:
-            return torch.tensor(1.0)
-        return torch.tensor(neg / pos)
+    def class_weights(self, num_classes: int = 8) -> torch.Tensor:
+        """Returns per-class inverse frequency weights for CrossEntropyLoss."""
+        class_counts = [0] * num_classes
+        for s in self.samples:
+            class_counts[s[3]] += 1
+        total = sum(class_counts)
+        if total == 0:
+            return torch.ones(num_classes)
+        weights = [total / (num_classes * (c or 1)) for c in class_counts]
+        return torch.tensor(weights, dtype=torch.float32)
 
 
 # ── Streaming video-level DataLoader ─────────────────────────────────────────
@@ -260,8 +271,8 @@ class VideoStreamDataset(Dataset):
     ):
         self.records: list[tuple[str, list[float], dict[int, int]]] = []
         for _, row in df.iterrows():
-            pos_map = build_frame_labels(row["events"])
-            self.records.append((row["video_path"], row["bbox"], pos_map))
+            label_map = build_frame_labels(row["events"])
+            self.records.append((row["video_path"], row["bbox"], label_map))
 
         resize_norm = transforms.Compose([
             transforms.ToPILImage(),
@@ -275,7 +286,7 @@ class VideoStreamDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int):
-        vpath, bbox, pos_map = self.records[idx]
+        vpath, bbox, label_map = self.records[idx]
 
         frames_t: list[torch.Tensor] = []
         labels:   list[int]          = []
@@ -289,7 +300,7 @@ class VideoStreamDataset(Dataset):
                 frame_np = packet.to_ndarray(format="rgb24")
                 cropped  = crop_frame(frame_np, bbox)
                 frames_t.append(self.transform(cropped))
-                labels.append(1 if fi in pos_map else 0)
+                labels.append(label_map.get(fi, 0))
 
             container.close()
         except Exception as exc:
