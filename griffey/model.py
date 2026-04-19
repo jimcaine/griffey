@@ -1,5 +1,5 @@
 """
-model.py – EfficientNet-V2-S backbone with a lightweight binary classification head.
+model.py – EfficientNet-V2-S backbone with an 8-class swing event classification head.
 
 Why EfficientNet-V2-S over MobileNetV2?
   • ~25% higher ImageNet top-1 accuracy (83.9% vs 71.8%)
@@ -22,13 +22,14 @@ from torchvision.models import (
 
 class GolfSwingClassifier(nn.Module):
     """
-    Binary classifier: 1 = frame is between Toe-up and Mid-backswing.
+    Multi-class swing event classifier: predicts which phase each frame belongs to.
 
     The head is intentionally small – the pretrained backbone already
     extracts rich spatial features; we just need a robust linear readout
     with enough regularisation to prevent over-fitting on a small dataset.
 
     Args:
+        num_classes   – Number of event classes (default 8, but supports 10 for GolfDB).
         backbone_name – "efficientnet_v2_s" | "convnext_tiny"
         pretrained    – Load ImageNet weights.
         dropout       – Dropout probability before the final linear layer.
@@ -38,6 +39,7 @@ class GolfSwingClassifier(nn.Module):
 
     def __init__(
         self,
+        num_classes: int = 8,
         backbone_name: str = "efficientnet_v2_s",
         pretrained: bool = True,
         dropout: float = 0.3,
@@ -72,13 +74,14 @@ class GolfSwingClassifier(nn.Module):
         self.backbone = backbone
 
         # ── Classification head ──────────────────────────────────────────────
+        self.num_classes = num_classes
         self.head = nn.Sequential(
             nn.BatchNorm1d(in_features),
             nn.Dropout(dropout),
             nn.Linear(in_features, 256),
             nn.GELU(),
             nn.Dropout(dropout * 0.5),
-            nn.Linear(256, 1),   # raw logit – use BCEWithLogitsLoss
+            nn.Linear(256, num_classes),   # num_classes logits – use CrossEntropyLoss
         )
 
         # Sensible weight initialisation for the head
@@ -89,9 +92,9 @@ class GolfSwingClassifier(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, C, H, W) → logits: (B,)"""
+        """x: (B, C, H, W) → logits: (B, num_classes)"""
         features = self.backbone(x)          # (B, in_features)
-        return self.head(features).squeeze(1)  # (B,)
+        return self.head(features)           # (B, num_classes)
 
     def unfreeze_all(self) -> None:
         """Call after initial warm-up to fine-tune the full network."""
@@ -108,12 +111,14 @@ class GolfSwingClassifier(nn.Module):
 # ── Convenience factory ───────────────────────────────────────────────────────
 
 def build_model(
+    num_classes: int = 8,
     backbone: str = "efficientnet_v2_s",
     pretrained: bool = True,
     dropout: float = 0.3,
     freeze_until: int = 5,
 ) -> GolfSwingClassifier:
     model = GolfSwingClassifier(
+        num_classes=num_classes,
         backbone_name=backbone,
         pretrained=pretrained,
         dropout=dropout,

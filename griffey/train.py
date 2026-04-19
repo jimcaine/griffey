@@ -6,15 +6,14 @@ Usage (quick start):
 
 Key design decisions
 ────────────────────
+* Multi-class (8-event) classification with CrossEntropyLoss.
+* Per-class weights to handle imbalanced event distribution.
 * Two-phase training:
     Phase 1 (warm-up)  – backbone frozen, only head trains for WARMUP_EPOCHS.
     Phase 2 (fine-tune)– entire network unfrozen, lower LR.
-* BCEWithLogitsLoss with pos_weight to handle the natural class imbalance
-  (most frames are NOT between TU and MB).
 * Mixed-precision (torch.amp) for memory efficiency on the 12 GB GPU.
 * Cosine annealing LR schedule in fine-tune phase.
-* Best checkpoint saved by validation F1 (more robust than accuracy for
-  imbalanced data).
+* Best checkpoint saved by validation F1 (macro-averaged for multi-class).
 """
 
 import argparse
@@ -29,11 +28,11 @@ from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torchmetrics.classification import (
-    BinaryAccuracy,
-    BinaryF1Score,
-    BinaryPrecision,
-    BinaryRecall,
-    BinaryAUROC,
+    MulticlassAccuracy,
+    MulticlassF1Score,
+    MulticlassPrecision,
+    MulticlassRecall,
+    MulticlassAUROC,
 )
 
 from griffey.data  import LocalBlobfs, read_train_data, make_dataloaders
@@ -68,13 +67,13 @@ DEFAULTS = dict(
 
 # ── Metric helpers ────────────────────────────────────────────────────────────
 
-def make_metrics(device):
+def make_metrics(device, num_classes: int = 8):
     return {
-        "acc"  : BinaryAccuracy().to(device),
-        "f1"   : BinaryF1Score().to(device),
-        "prec" : BinaryPrecision().to(device),
-        "rec"  : BinaryRecall().to(device),
-        "auroc": BinaryAUROC().to(device),
+        "acc"  : MulticlassAccuracy(num_classes=num_classes, average="macro").to(device),
+        "f1"   : MulticlassF1Score(num_classes=num_classes, average="macro").to(device),
+        "prec" : MulticlassPrecision(num_classes=num_classes, average="macro").to(device),
+        "rec"  : MulticlassRecall(num_classes=num_classes, average="macro").to(device),
+        "auroc": MulticlassAUROC(num_classes=num_classes, average="macro").to(device),
     }
 
 
@@ -108,7 +107,7 @@ def run_epoch(
     with ctx:
         for batch_idx, (imgs, labels) in enumerate(loader):
             imgs   = imgs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True).float()
+            labels = labels.to(device, non_blocking=True).long()
 
             with autocast(device_type=amp_device_type, enabled=scaler is not None):
                 logits = model(imgs)
@@ -130,13 +129,13 @@ def run_epoch(
             total_loss += loss.item()
             n_batches  += 1
 
-            probs = torch.sigmoid(logits).detach()
-            preds = (probs >= 0.5).long()
-            for m in metrics.values():
-                try:
-                    m.update(probs, labels.long())
-                except Exception:
-                    m.update(preds, labels.long())
+            probs = torch.softmax(logits, dim=1).detach()
+            preds = torch.argmax(probs, dim=1)
+            # AUROC needs probabilities; others need class indices
+            metrics["auroc"].update(probs, labels)
+            for k, m in metrics.items():
+                if k != "auroc":
+                    m.update(preds, labels)
 
             if is_train and (batch_idx + 1) % 50 == 0:
                 logger.info(
@@ -170,20 +169,27 @@ def train(cfg: dict) -> None:
         max_frames_per_video = cfg["max_frames"],
     )
 
+    # Infer number of classes from training dataset
+    train_ds = train_loader.dataset
+    max_label = max((s[3] for s in train_ds.samples), default=7)
+    num_classes = max(8, max_label + 1)
+    logger.info("Number of event classes detected: %d", num_classes)
+
     # ── Model ────────────────────────────────────────────────────────────────
     model = build_model(
+        num_classes  = num_classes,
         backbone     = cfg["backbone"],
         dropout      = cfg["dropout"],
         freeze_until = cfg["freeze_until"],
     ).to(device)
 
-    pos_weight = train_loader.dataset.pos_weight().to(device)
-    logger.info("pos_weight for BCELoss: %.3f", pos_weight.item())
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    class_weights = train_loader.dataset.class_weights(num_classes=num_classes).to(device)
+    logger.info("class_weights for CELoss: %s", class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # ── Phase 1: warm-up (head only) ─────────────────────────────────────────
     scaler  = GradScaler() if (cfg["amp"] and device.type == "cuda") else None
-    metrics = make_metrics(device)
+    metrics = make_metrics(device, num_classes=num_classes)
 
     ckpt_dir = Path(cfg["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -255,12 +261,12 @@ def predict_video(
     bbox: list[float],
     device: torch.device,
     input_size: int = 224,
-    threshold: float = 0.5,
-) -> list[tuple[int, float, int]]:
+) -> list[tuple[int, int, list[float]]]:
     """
     Run inference on every frame of a video.
 
-    Returns list of (frame_idx, probability, predicted_label).
+    Returns list of (frame_idx, predicted_class, class_probs).
+    class_probs is a list of 8 softmax scores.
     """
     from torchvision import transforms
     from data import crop_frame, IMAGENET_MEAN, IMAGENET_STD
@@ -285,10 +291,10 @@ def predict_video(
             cropped  = crop_frame(frame_np, bbox)
             tensor   = tf(cropped).unsqueeze(0).to(device)
 
-            logit = model(tensor)
-            prob  = torch.sigmoid(logit).item()
-            pred  = int(prob >= threshold)
-            results.append((fi, prob, pred))
+            logits = model(tensor)
+            probs  = torch.softmax(logits, dim=1)[0]  # (8,)
+            pred   = int(torch.argmax(probs).item())
+            results.append((fi, pred, probs.cpu().tolist()))
 
     container.close()
     return results
@@ -330,7 +336,7 @@ def load_checkpoint(model, path: str, device: torch.device):
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> dict:
-    p = argparse.ArgumentParser(description="Train TU→MB golf swing classifier")
+    p = argparse.ArgumentParser(description="Train 8-class golf swing event phase classifier")
     for key, val in DEFAULTS.items():
         t = type(val) if val is not None else str
         if t == bool:

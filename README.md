@@ -1,5 +1,5 @@
-# Griffey: Golf Swing Phase Classifier
-**Task:** Binary frame-level classification – is this frame between *Toe-up (TU)* and *Mid-backswing (MB)*?
+# Griffey: Golf Swing Event Phase Classifier
+**Task:** Multi-class frame-level classification – predict which swing event phase each frame belongs to (0=Address, 1=Toe-up, 2=Mid-backswing, ..., 7=Finish).
 
 ## File overview
 
@@ -29,21 +29,27 @@ Swap to `--backbone convnext_tiny` for a slightly different inductive bias (same
 
 ### Head
 ```
-BN(in_features) → Dropout(0.3) → Linear(→256) → GELU → Dropout(0.15) → Linear(→1)
+BN(in_features) → Dropout(0.3) → Linear(→256) → GELU → Dropout(0.15) → Linear(→8)
 ```
-Output is a raw logit; use `sigmoid` at inference time.
+Output is 8 class logits; use `softmax` at inference time.
 
 ---
 
 ## Labelling logic
 
+Each frame is assigned the index of the last swing event it has passed:
+
 ```python
 events = [0, 47, 65, 68, 82, 87, 90, 93, 106, 137]
-#              ↑TU  ↑MB
-# Frames 48..64 are labelled 1, all others 0.
+#         ↑   ↑   ↑   ↑   ↑   ↑   ↑   ↑   ↑    ↑
+#         A   TU  MB  T   MD  I   MFT F   ?    ?
+# Frames [0, 47):  label 0 (Address)
+# Frames [47, 65): label 1 (Toe-up)
+# Frames [65, 68): label 2 (Mid-backswing)
+# ...and so on
 ```
 
-`TU = events[1]`, `MB = events[2]` (exclusive range: `TU < frame < MB`).
+Each frame gets the index of the event boundary it has most recently crossed.
 
 ---
 
@@ -81,8 +87,8 @@ python train.py \
 2. **Fine-tune** (`--finetune_epochs`, default 20): full network unfrozen, lower `lr=5e-5` with cosine annealing.
 
 ### Handling class imbalance
-`BCEWithLogitsLoss(pos_weight=neg/pos)` is computed automatically from the training split.  
-For a typical clip, ~10–20 % of frames fall in the TU→MB window, giving `pos_weight ≈ 5–9`.
+`CrossEntropyLoss(weight=class_weights)` with per-class inverse frequency weights is computed automatically from the training split.  
+Different phases have different duration distributions, so class weights balance the contribution of rare event phases.
 
 ---
 
@@ -100,8 +106,9 @@ loader = DataLoader(ds, batch_size=1, collate_fn=video_stream_collate,
 
 for batch in loader:
     (frames, labels, path), = batch   # frames: (N, C, H, W)
-    logits = model(frames.to(device))
-    probs  = torch.sigmoid(logits)
+    logits = model(frames.to(device))  # (N, 8)
+    probs  = torch.softmax(logits, dim=1)
+    preds  = torch.argmax(probs, dim=1)  # predicted class per frame
 ```
 
 ---
