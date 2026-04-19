@@ -27,6 +27,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
+from griffey.video import crop_frame, probe_frame_count, decode_single_frame
+
 logger = logging.getLogger(__name__)
 
 # ── Event indices ────────────────────────────────────────────────────────────
@@ -121,27 +123,6 @@ def build_frame_labels(events: list[int]) -> dict[int, int]:
     return labels
 
 
-# ── Crop helper ──────────────────────────────────────────────────────────────
-
-def crop_frame(frame_np: np.ndarray, bbox: list[float]) -> np.ndarray:
-    """
-    Crop a HxWxC uint8 numpy array using a normalised [x0,y0,x1,y1] bbox.
-    Returns the cropped region (may be empty if bbox is degenerate).
-    """
-    H, W = frame_np.shape[:2]
-    x0 = int(bbox[0] * W)
-    y0 = int(bbox[1] * H)
-    x1 = int(bbox[2] * W)
-    y1 = int(bbox[3] * H)
-
-    x0, x1 = max(0, x0), min(W, x1)
-    y0, y1 = max(0, y0), min(H, y1)
-
-    if x1 <= x0 or y1 <= y0:
-        return frame_np          # fallback: return full frame
-
-    return frame_np[y0:y1, x0:x1]
-
 
 # ── Core dataset ─────────────────────────────────────────────────────────────
 
@@ -194,7 +175,7 @@ class GolfSwingDataset(Dataset):
                 continue
 
             # Count frames without decoding via PyAV container probe
-            total_frames = _probe_frame_count(vpath)
+            total_frames = probe_frame_count(vpath)
             if total_frames == 0:
                 reason = f"could not probe frame count: {vpath}"
                 skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
@@ -259,7 +240,7 @@ class GolfSwingDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         vpath, bbox, frame_idx, label = self.samples[idx]
 
-        frame_np = _decode_single_frame(vpath, frame_idx)   # HxWxC uint8
+        frame_np = decode_single_frame(vpath, frame_idx)   # HxWxC uint8
         cropped  = crop_frame(frame_np, bbox)
         tensor   = self.transform(cropped)
 
@@ -355,69 +336,6 @@ def video_stream_collate(batch):
     return batch   # list of (frames, labels, path) – do NOT stack across videos
 
 
-# ── Low-level video utilities ─────────────────────────────────────────────────
-
-def _probe_frame_count(video_path: str) -> int:
-    """Return approximate frame count from container metadata (fast, no decode)."""
-    try:
-        container = av.open(video_path)
-        stream    = container.streams.video[0]
-        count     = stream.frames
-        if count and count > 0:
-            container.close()
-            return int(count)
-        # Fallback: iterate (slow but reliable)
-        count = sum(1 for _ in container.decode(stream))
-        container.close()
-        return count
-    except Exception as exc:
-        logger.error("Could not probe %s: %s", video_path, exc)
-        return 0
-
-
-def _decode_single_frame(video_path: str, target_frame: int) -> np.ndarray:
-    """
-    Decode and return a single frame by index as a (H, W, 3) uint8 ndarray.
-
-    Strategy: seek to the nearest keyframe then step forward.  This is much
-    faster than decoding from the beginning for large frame indices.
-    """
-    try:
-        container = av.open(video_path)
-        stream    = container.streams.video[0]
-        stream.thread_type = "AUTO"
-
-        fps      = float(stream.average_rate or 30)
-        duration = stream.duration  # in stream time_base units
-        tb       = float(stream.time_base)
-
-        if duration:
-            # Seek to ~1 sec before the target frame
-            seek_ts = max(0, int((target_frame / fps - 1.0) / tb))
-            container.seek(seek_ts, stream=stream, backward=True, any_frame=False)
-
-        frame_np = None
-        for fi, frame in enumerate(container.decode(stream)):
-            # After seeking we may start a few frames before the target
-            current = frame.pts or 0
-            current_idx = int(current * tb * fps)
-            if current_idx >= target_frame or fi >= target_frame + 5:
-                frame_np = frame.to_ndarray(format="rgb24")
-                break
-            # Always keep the last decoded frame as fallback
-            frame_np = frame.to_ndarray(format="rgb24")
-
-        container.close()
-
-        if frame_np is None:
-            raise ValueError(f"Frame {target_frame} not found in {video_path}")
-        return frame_np
-
-    except Exception as exc:
-        logger.error("Decode error %s frame %d: %s", video_path, target_frame, exc)
-        # Return a blank frame so training doesn't crash
-        return np.zeros((160, 160, 3), dtype=np.uint8)
-
 
 # ── Factory helpers ───────────────────────────────────────────────────────────
 
@@ -471,18 +389,3 @@ def make_dataloaders(
         prefetch_factor=2 if num_workers > 0 else None,
     )
     return train_loader, val_loader
-
-
-if __name__ == "__main__":
-    # Quick test of dataset loading
-    logging.basicConfig(level=logging.INFO)
-    blobfs = LocalBlobfs()
-    df = read_train_data(blobfs)
-    print(df)
-    # train_loader, val_loader = make_dataloaders(df, batch_size=4, num_workers=0)
-
-    # for batch in train_loader:
-    #     images, labels = batch
-    #     print("Batch images shape:", images.shape)
-    #     print("Batch labels:", labels)
-    #     break
