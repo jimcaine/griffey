@@ -7,9 +7,9 @@ logger = logging.getLogger(__name__)
 
 
 def crop_frame(frame_np: np.ndarray, bbox: list[float]) -> np.ndarray:
-    """
-    Crop a HxWxC uint8 numpy array using a normalised [x0,y0,x1,y1] bbox.
-    Returns the cropped region (may be empty if bbox is degenerate).
+    """ Crop a HxWxC uint8 numpy array using a normalised [x0,y0,x1,y1] bbox.
+    Returns the cropped region; if the bbox is degenerate after clipping,
+    returns the full frame as a fallback.
     """
     H, W = frame_np.shape[:2]
     x0 = int(bbox[0] * W)
@@ -27,9 +27,14 @@ def crop_frame(frame_np: np.ndarray, bbox: list[float]) -> np.ndarray:
 
 
 def probe_frame_count(video_path: str) -> int:
-    """Return approximate frame count from container metadata (fast, no decode)."""
+    """ Return approximate frame count from container metadata. """
     try:
         container = av.open(video_path)
+    except Exception as exc:
+        logger.error("Could not open %s: %s", video_path, exc)
+        return 0
+
+    try:
         stream    = container.streams.video[0]
         count     = stream.frames
         if count and count > 0:
@@ -37,11 +42,12 @@ def probe_frame_count(video_path: str) -> int:
             return int(count)
         # Fallback: iterate (slow but reliable)
         count = sum(1 for _ in container.decode(stream))
-        container.close()
         return count
     except Exception as exc:
-        logger.error(f"Could not probe {video_path}: {exc}")
+        logger.error("Could not probe %s: %s", video_path, exc)
         return 0
+    finally:
+        container.close()
 
 
 def decode_single_frame(video_path: str, target_frame: int) -> np.ndarray:
@@ -53,6 +59,12 @@ def decode_single_frame(video_path: str, target_frame: int) -> np.ndarray:
     """
     try:
         container = av.open(video_path)
+    except Exception as e:
+        logger.error("Could not open %s: %s", video_path, e)
+        # Return a blank frame so training doesn't crash
+        return np.zeros((160, 160, 3), dtype=np.uint8)
+
+    try:
         stream    = container.streams.video[0]
         stream.thread_type = "AUTO"
 
@@ -76,13 +88,15 @@ def decode_single_frame(video_path: str, target_frame: int) -> np.ndarray:
             # Always keep the last decoded frame as fallback
             frame_np = frame.to_ndarray(format="rgb24")
 
-        container.close()
 
         if frame_np is None:
-            raise ValueError(f"Frame {target_frame} not found in {video_path}")
+            raise ValueError("Frame %d not found in %s", target_frame, video_path)
         return frame_np
 
     except Exception as exc:
-        logger.error(f"Decode error {video_path} frame {target_frame}: {exc}")
+        logger.error("Decode error %s frame %d: %s", video_path, target_frame, exc)
         # Return a blank frame so training doesn't crash
         return np.zeros((160, 160, 3), dtype=np.uint8)
+
+    finally:
+        container.close()
