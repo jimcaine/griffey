@@ -174,18 +174,31 @@ class GolfSwingDataset(Dataset):
         if video_indices is not None:
             df = df.iloc[video_indices].reset_index(drop=True)
 
+        logger.info("GolfSwingDataset init: %d videos in dataframe", len(df))
+
         # Build flat index: list of (video_path, bbox, frame_idx, label)
         self.samples: list[tuple[str, list[float], int, int]] = []
+        skipped_count = 0
+        skipped_reasons = {}
 
-        for _, row in df.iterrows():
+        for idx, (_, row) in enumerate(df.iterrows()):
             vpath  = row["video_path"]
             bbox   = row["bbox"]
             events = row["events"]
 
+            # Validate events format
+            if not isinstance(events, list):
+                reason = f"events not a list (got {type(events).__name__})"
+                skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+                skipped_count += 1
+                continue
+
             # Count frames without decoding via PyAV container probe
             total_frames = _probe_frame_count(vpath)
             if total_frames == 0:
-                logger.warning("Skipping %s – could not probe frame count", vpath)
+                reason = f"could not probe frame count: {vpath}"
+                skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+                skipped_count += 1
                 continue
 
             label_map = build_frame_labels(events)
@@ -199,13 +212,28 @@ class GolfSwingDataset(Dataset):
                 label = label_map.get(fidx, 0)  # default to label 0 if out of events range
                 self.samples.append((vpath, bbox, fidx, label))
 
-        class_counts = [0] * 8
+        # Determine number of classes from actual samples
+        max_label = 0
         for s in self.samples:
-            class_counts[s[3]] += 1
+            if s[3] >= 0:
+                max_label = max(max_label, s[3])
+
+        num_classes = max(8, max_label + 1)  # at least 8, but more if data has it
+        class_counts = [0] * num_classes
+
+        for s in self.samples:
+            label = s[3]
+            if label < 0 or label >= num_classes:
+                logger.error("Sample has invalid label %d: %s", label, s)
+                continue
+            class_counts[label] += 1
+
         logger.info(
-            "Dataset built: %d samples | class dist: %s",
-            len(self.samples), class_counts,
+            "Dataset built: %d samples | %d videos skipped | class dist: %s",
+            len(self.samples), skipped_count, class_counts,
         )
+        if skipped_reasons:
+            logger.info("Skip reasons: %s", skipped_reasons)
 
         # Transforms
         crop_and_resize = [
@@ -238,11 +266,18 @@ class GolfSwingDataset(Dataset):
         return tensor, label
 
     # ── Class-weight helper for imbalanced data ──────────────────────────────
-    def class_weights(self, num_classes: int = 8) -> torch.Tensor:
+    def class_weights(self, num_classes: Optional[int] = None) -> torch.Tensor:
         """Returns per-class inverse frequency weights for CrossEntropyLoss."""
+        if num_classes is None:
+            # Infer from data
+            max_label = max((s[3] for s in self.samples), default=7)
+            num_classes = max(8, max_label + 1)
+
         class_counts = [0] * num_classes
         for s in self.samples:
-            class_counts[s[3]] += 1
+            label = s[3]
+            if 0 <= label < num_classes:
+                class_counts[label] += 1
         total = sum(class_counts)
         if total == 0:
             return torch.ones(num_classes)

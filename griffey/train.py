@@ -67,13 +67,13 @@ DEFAULTS = dict(
 
 # ── Metric helpers ────────────────────────────────────────────────────────────
 
-def make_metrics(device):
+def make_metrics(device, num_classes: int = 8):
     return {
-        "acc"  : MulticlassAccuracy(num_classes=8, average="macro").to(device),
-        "f1"   : MulticlassF1Score(num_classes=8, average="macro").to(device),
-        "prec" : MulticlassPrecision(num_classes=8, average="macro").to(device),
-        "rec"  : MulticlassRecall(num_classes=8, average="macro").to(device),
-        "auroc": MulticlassAUROC(num_classes=8, average="macro").to(device),
+        "acc"  : MulticlassAccuracy(num_classes=num_classes, average="macro").to(device),
+        "f1"   : MulticlassF1Score(num_classes=num_classes, average="macro").to(device),
+        "prec" : MulticlassPrecision(num_classes=num_classes, average="macro").to(device),
+        "rec"  : MulticlassRecall(num_classes=num_classes, average="macro").to(device),
+        "auroc": MulticlassAUROC(num_classes=num_classes, average="macro").to(device),
     }
 
 
@@ -131,8 +131,11 @@ def run_epoch(
 
             probs = torch.softmax(logits, dim=1).detach()
             preds = torch.argmax(probs, dim=1)
-            for m in metrics.values():
-                m.update(preds, labels)
+            # AUROC needs probabilities; others need class indices
+            metrics["auroc"].update(probs, labels)
+            for k, m in metrics.items():
+                if k != "auroc":
+                    m.update(preds, labels)
 
             if is_train and (batch_idx + 1) % 50 == 0:
                 logger.info(
@@ -166,20 +169,27 @@ def train(cfg: dict) -> None:
         max_frames_per_video = cfg["max_frames"],
     )
 
+    # Infer number of classes from training dataset
+    train_ds = train_loader.dataset
+    max_label = max((s[3] for s in train_ds.samples), default=7)
+    num_classes = max(8, max_label + 1)
+    logger.info("Number of event classes detected: %d", num_classes)
+
     # ── Model ────────────────────────────────────────────────────────────────
     model = build_model(
+        num_classes  = num_classes,
         backbone     = cfg["backbone"],
         dropout      = cfg["dropout"],
         freeze_until = cfg["freeze_until"],
     ).to(device)
 
-    class_weights = train_loader.dataset.class_weights(num_classes=8).to(device)
+    class_weights = train_loader.dataset.class_weights(num_classes=num_classes).to(device)
     logger.info("class_weights for CELoss: %s", class_weights)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # ── Phase 1: warm-up (head only) ─────────────────────────────────────────
     scaler  = GradScaler() if (cfg["amp"] and device.type == "cuda") else None
-    metrics = make_metrics(device)
+    metrics = make_metrics(device, num_classes=num_classes)
 
     ckpt_dir = Path(cfg["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
